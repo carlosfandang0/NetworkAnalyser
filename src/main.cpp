@@ -255,6 +255,7 @@ struct NetworkDevice {
 struct WiFiNetwork {
   String ssid;
   int rssi;
+  int channel;
   bool isOpen;
   wifi_auth_mode_t encryptionType;
   unsigned long lastSeen;
@@ -4632,6 +4633,7 @@ void NetworkTask(void *parameter)
       for (int i = 0; i < n; i++) {
         String ssid = WiFi.SSID(i);
         int rssi = WiFi.RSSI(i);
+        int channel = WiFi.channel(i);
         wifi_auth_mode_t encType = WiFi.encryptionType(i);
         bool isOpen = (encType == WIFI_AUTH_OPEN);
         
@@ -4640,6 +4642,7 @@ void NetworkTask(void *parameter)
         for (auto& net : wifiNetworks) {
           if (net.ssid == ssid) {
             net.rssi = rssi;  // Update signal strength
+            net.channel = channel;
             net.isOpen = isOpen;
             net.encryptionType = encType;
             net.lastSeen = currentTime;
@@ -4653,11 +4656,12 @@ void NetworkTask(void *parameter)
           WiFiNetwork newNet;
           newNet.ssid = ssid;
           newNet.rssi = rssi;
+          newNet.channel = channel;
           newNet.isOpen = isOpen;
           newNet.encryptionType = encType;
           newNet.lastSeen = currentTime;
           wifiNetworks.push_back(newNet);
-          Serial.printf("[WiFi Setup] New network: %s (%d dBm)\n", ssid.c_str(), rssi);
+          Serial.printf("[WiFi Setup] New network: %s (%d dBm, Ch %d)\n", ssid.c_str(), rssi, channel);
         }
       }
       WiFi.scanDelete();
@@ -4696,7 +4700,7 @@ void NetworkTask(void *parameter)
               
               lv_obj_t *label = lv_label_create(btn);
               String secType = getSecurityType(wifiNetworks[i].encryptionType);
-              String labelText = wifiNetworks[i].ssid + " (" + String(wifiNetworks[i].rssi) + " dBm) [" + secType + "]";
+              String labelText = wifiNetworks[i].ssid + " (" + String(wifiNetworks[i].rssi) + " dBm) Ch" + String(wifiNetworks[i].channel) + " [" + secType + "]";
               lv_label_set_text(label, labelText.c_str());
               lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
               lv_obj_align(label, LV_ALIGN_LEFT_MID, 10, 0);
