@@ -1,0 +1,8 @@
+0:T WiFi SSID=
+1:T WiFi Password=
+2:T AP SSID=Network Analyser
+3:T AP Password=Epoxy123
+4:B Active Probe=1
+5:I Probe Interval=30
+6:I Device Timeout=0
+7:I Timezone Offset=0
