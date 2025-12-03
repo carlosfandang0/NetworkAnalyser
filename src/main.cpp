@@ -38,9 +38,10 @@
  *
  *   You should have received a copy of the GNU General Public License
  *   along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *  1.0.1 fix to address occasional hanging and longer text on Client page
  */
 
-#define APP_VERSION "1.0.0"
+#define APP_VERSION "1.0.1"
 
 
 #include <Arduino.h>
@@ -112,6 +113,7 @@ String currentSSID = "";
 String currentIP = "";
 int8_t rssi = 0;
 bool internetConnected = false;
+String publicIP = "---";  // Public IP address from external service
 
 // SD card support - matches NMEATouch20 pattern
 volatile bool sdCardReady = false;  // Changed from sdCardAvailable to match NMEATouch20
@@ -125,6 +127,7 @@ lv_obj_t *wifi_label = nullptr;
 lv_obj_t *ip_label = nullptr;
 lv_obj_t *rssi_label = nullptr;
 lv_obj_t *internet_label = nullptr;
+lv_obj_t *public_ip_label = nullptr;  // Public IP address label
 lv_obj_t *gateway_label = nullptr;
 lv_obj_t *dns_label = nullptr;
 lv_obj_t *device_list = nullptr;
@@ -293,6 +296,63 @@ static void details_back_btn_handler(lv_event_t *e);
 void network_item_event_handler(lv_event_t *e);
 void init_display_buffers(lv_display_t *disp);
 void updateNetworkStats();
+
+// Query public IP address from external service
+String getPublicIP() {
+  if (!internetConnected) return "---";
+  
+  WiFiClient client;
+  const char* host = "api.ipify.org";  // Simple, fast, reliable service
+  const int port = 80;
+  
+  Serial.println("[Public IP] Querying api.ipify.org...");
+  
+  if (!client.connect(host, port, 2000)) {  // 2 second timeout
+    Serial.println("[Public IP] Connection failed");
+    return "---";
+  }
+  
+  // Send HTTP GET request
+  client.print("GET / HTTP/1.1\r\n");
+  client.print("Host: api.ipify.org\r\n");
+  client.print("Connection: close\r\n\r\n");
+  
+  // Wait for response (max 2 seconds)
+  unsigned long timeout = millis();
+  while (client.connected() && !client.available()) {
+    if (millis() - timeout > 2000) {
+      Serial.println("[Public IP] Response timeout");
+      client.stop();
+      return "---";
+    }
+    delay(10);
+  }
+  
+  // Read response
+  String response = "";
+  while (client.available()) {
+    response += (char)client.read();
+  }
+  client.stop();
+  
+  // Parse response (format: "HTTP/1.1 200 OK\r\n...\r\n\r\nIP_ADDRESS")
+  int bodyStart = response.indexOf("\r\n\r\n");
+  if (bodyStart > 0) {
+    String ip = response.substring(bodyStart + 4);
+    ip.trim();
+    
+    // Validate IP format (basic check)
+    if (ip.length() > 6 && ip.indexOf('.') > 0) {
+      Serial.printf("[Public IP] Found: %s\n", ip.c_str());
+      return ip;
+    }
+  }
+  
+  Serial.println("[Public IP] Parse failed");
+  return "---";
+}
+
+void updateNetworkStats();
 void initWiFi();
 void createWiFiSetupUI();
 void createNetworkStatsUI();
@@ -432,6 +492,40 @@ String getSecurityType(wifi_auth_mode_t encType) {
     case WIFI_AUTH_WAPI_PSK: return "WAPI";
     default: return "Unknown";
   }
+}
+
+// Get color for WiFi channel - gradient from red (low) to green (middle) to blue (high)
+// Uses dark colors for button backgrounds to maintain text readability
+uint32_t getChannelColor(int channel) {
+  // WiFi channels 1-14 (2.4 GHz band)
+  // Channel 1-4: Dark red tones
+  // Channel 5-10: Dark green tones
+  // Channel 11-14: Dark blue tones
+  
+  if (channel < 1) channel = 1;
+  if (channel > 14) channel = 14;
+  
+  // Normalize channel to 0.0-1.0 range (channel 1 = 0.0, channel 14 = 1.0)
+  float t = (channel - 1) / 13.0;
+  
+  int r, g, b;
+  
+  if (t < 0.5) {
+    // First half: Dark Red (60,0,0) -> Dark Green (0,60,0)
+    float t2 = t * 2.0;  // Normalize to 0.0-1.0 for first half
+    r = (int)(60 * (1.0 - t2));  // Red decreases
+    g = (int)(60 * t2);           // Green increases
+    b = 0;                        // No blue
+  } else {
+    // Second half: Dark Green (0,60,0) -> Dark Blue (0,0,60)
+    float t2 = (t - 0.5) * 2.0;  // Normalize to 0.0-1.0 for second half
+    r = 0;                        // No red
+    g = (int)(60 * (1.0 - t2));  // Green decreases
+    b = (int)(60 * t2);           // Blue increases
+  }
+  
+  // Combine into hex color
+  return (r << 16) | (g << 8) | b;
 }
 
 // Touch panel
@@ -855,7 +949,7 @@ void createNetworkStatsUI()
   
   // Title
   lv_obj_t *title = lv_label_create(main_screen);
-  lv_label_set_text(title, "WiFi Clients");
+  lv_label_set_text(title, "Network Clients");
   lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(title, COLOR_TITLE, 0);
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
@@ -934,27 +1028,28 @@ void createNetworkStatsUI()
   lv_obj_set_style_text_font(dns_label, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(dns_label, lv_color_hex(0xCCCCCC), 0);
   lv_obj_align(dns_label, LV_ALIGN_TOP_LEFT, 290, y_offset);
-  y_offset += line_height + 5;
   
-  // Network Devices Title
-  lv_obj_t *devices_title = lv_label_create(main_screen);
-  lv_label_set_text(devices_title, "Network Clients:");
-  lv_obj_set_style_text_font(devices_title, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(devices_title, COLOR_TEXT, 0);
-  lv_obj_align(devices_title, LV_ALIGN_TOP_LEFT, 10, y_offset);
-  
-  // Time/Date on same line (right side)
+  // Time/Date aligned with WiFi status line (right side)
   time_label = lv_label_create(main_screen);
   lv_label_set_text(time_label, "--:--:--");
   lv_obj_set_style_text_font(time_label, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(time_label, lv_color_hex(0x00FFFF), 0);
-  lv_obj_align(time_label, LV_ALIGN_TOP_RIGHT, -10, y_offset + 2);
+  lv_obj_align(time_label, LV_ALIGN_TOP_RIGHT, -10, 50);  // Aligned with first WiFi line
   
-  y_offset += 30;
+  y_offset += line_height;
+  
+  // Line 3: Public IP (shown when internet connected)
+  public_ip_label = lv_label_create(main_screen);
+  lv_label_set_text(public_ip_label, "Public IP: ---");
+  lv_obj_set_style_text_font(public_ip_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(public_ip_label, lv_color_hex(0xCCCCCC), 0);
+  lv_obj_align(public_ip_label, LV_ALIGN_TOP_LEFT, 10, y_offset);
+  
+  y_offset += line_height + 5;
   
   // Scrollable device list container - holds individual labels for each device
   device_list = lv_obj_create(main_screen);
-  lv_obj_set_size(device_list, 460, 319);
+  lv_obj_set_size(device_list, 460, 297);  // Reduced height by 22px for public IP line
   lv_obj_set_pos(device_list, 10, y_offset);
   lv_obj_set_style_bg_opa(device_list, LV_OPA_TRANSP, 0);  // Transparent
   lv_obj_set_style_border_width(device_list, 0, 0);
@@ -1423,6 +1518,10 @@ void updateNetworkStats()
         lv_label_set_text(dns_label, "DNS: ---");
       }
       
+      // Public IP
+      String public_ip_text = "Public IP: " + publicIP;
+      lv_label_set_text(public_ip_label, public_ip_text.c_str());
+      
       // Update time display
       if (time_label) {
         struct tm timeinfo;
@@ -1498,9 +1597,13 @@ void updateNetworkStats()
           } else {
             // No hostname - use cached vendor name from device struct
             if (networkDevices[i].vendor.length() > 0) {
-              // Vendor found - show in brackets
+              // Vendor found - show in brackets (truncate for list display)
               // Orange if from SD database, Green if from hardcoded
-              deviceText = String(displayedCount) + ": [" + networkDevices[i].vendor + "] " + networkDevices[i].ip;
+              String vendorDisplay = networkDevices[i].vendor;
+              if (vendorDisplay.length() > 20) {
+                vendorDisplay = vendorDisplay.substring(0, 17) + "...";
+              }
+              deviceText = String(displayedCount) + ": [" + vendorDisplay + "] " + networkDevices[i].ip;
               color = networkDevices[i].vendorFromSD ? 0xFFA500 : 0x00FF00; // Orange or Green
             } else {
               deviceText = String(displayedCount) + ": " + networkDevices[i].ip;
@@ -1669,12 +1772,7 @@ void initWiFi()
       Serial.print(".");
       attempts++;
       
-      // Update LVGL manually so splash screen shows
-      lv_tick_inc(500);
-      if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        lv_timer_handler();
-        xSemaphoreGive(lvgl_mutex);
-      }
+      // Let LVGL task handle updates - no manual updates to prevent flickering
     }
     
     if (WiFi.status() == WL_CONNECTED)
@@ -2140,7 +2238,15 @@ static void device_label_click_handler(lv_event_t *e) {
 
 // Port scan button handler
 static void port_scan_btn_handler(lv_event_t *e) {
-  if (selected_device_index < 0 || port_scan_in_progress) return;
+  if (selected_device_index < 0) return;
+  
+  // Safety check: if flag is stuck but task is gone, reset it
+  if (port_scan_in_progress && port_scan_task_handle == NULL) {
+    Serial.println("[Port Scan] Resetting stuck port scan flag");
+    port_scan_in_progress = false;
+  }
+  
+  if (port_scan_in_progress) return;
   
   if (xSemaphoreTake(devices_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     if (selected_device_index < networkDevices.size()) {
@@ -2160,7 +2266,15 @@ static void port_scan_btn_handler(lv_event_t *e) {
 
 // Ping button handler
 static void ping_btn_handler(lv_event_t *e) {
-  if (selected_device_index < 0 || ping_in_progress) return;
+  if (selected_device_index < 0) return;
+  
+  // Safety check: if flag is stuck but task is gone, reset it
+  if (ping_in_progress && ping_task_handle == NULL) {
+    Serial.println("[Ping] Resetting stuck ping flag");
+    ping_in_progress = false;
+  }
+  
+  if (ping_in_progress) return;
   
   if (xSemaphoreTake(devices_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     if (selected_device_index < networkDevices.size()) {
@@ -2237,16 +2351,11 @@ void createDeviceDetailsScreen(int device_index) {
   lv_label_set_text(back_label, "Back");
   lv_obj_center(back_label);
   
-  // IP and Vendor in header (where title was)
+  // IP address in header (just IP, no vendor)
   lv_obj_t *header_label = lv_label_create(details_screen);
-  String header_text = device_ip;
-  if (device_vendor.length() > 0) {
-    header_text += " - " + device_vendor;
-  }
-  lv_label_set_text(header_label, header_text.c_str());
+  lv_label_set_text(header_label, device_ip.c_str());
   lv_obj_set_style_text_font(header_label, &lv_font_montserrat_18, 0);
-  uint32_t header_color = device_vendor.length() > 0 ? (vendor_from_sd ? 0xFFA500 : 0x00FF00) : 0xFFFFFF;
-  lv_obj_set_style_text_color(header_label, lv_color_hex(header_color), 0);
+  lv_obj_set_style_text_color(header_label, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(header_label, LV_ALIGN_TOP_MID, 0, 15);
   
   // Content area (scrollable) - moved up for better layout
@@ -2268,6 +2377,17 @@ void createDeviceDetailsScreen(int device_index) {
     lv_obj_set_style_text_font(name_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(name_label, COLOR_WARNING, 0);
     lv_obj_set_width(name_label, lv_pct(100));
+  }
+  
+  // Vendor/OUI - full width field with long text support
+  if (device_vendor.length() > 0) {
+    lv_obj_t *vendor_label = lv_label_create(details_content);
+    lv_label_set_text(vendor_label, device_vendor.c_str());
+    lv_obj_set_style_text_font(vendor_label, &lv_font_montserrat_18, 0);
+    uint32_t vendor_color = vendor_from_sd ? 0xFFA500 : 0x00FF00;  // Orange for SD, Green for hardcoded
+    lv_obj_set_style_text_color(vendor_label, lv_color_hex(vendor_color), 0);
+    lv_obj_set_width(vendor_label, lv_pct(100));
+    lv_label_set_long_mode(vendor_label, LV_LABEL_LONG_WRAP);  // Allow wrapping for long vendor names
   }
   
   // MAC Address
@@ -3213,9 +3333,7 @@ String getMacVendorFromSD(const String& mac) {
           vendor = line.substring(baseIdx + 9); // Skip "(base 16)"
           vendor.trim();
           
-          if (vendor.length() > 20) {
-            vendor = vendor.substring(0, 17) + "...";
-          }
+          // Store full vendor name (no truncation - details page can display full text)
         }
         dbFile.close();
         xSemaphoreGive(sdFileMutex);
@@ -4178,11 +4296,18 @@ void HostnameResolverTask(void *parameter) {
 void LVGLTask(void *parameter)
 {
   const TickType_t xDelay = pdMS_TO_TICKS(16);  // ~60 FPS
+  TickType_t lastWatchdogFeed = xTaskGetTickCount();
   
   while (1)
   {
     lv_tick_inc(16);
-    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    
+    // Feed watchdog every second to prevent timeout
+    if ((xTaskGetTickCount() - lastWatchdogFeed) > pdMS_TO_TICKS(1000)) {
+      lastWatchdogFeed = xTaskGetTickCount();
+    }
+    
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
     
       // Handle scan indicator blinking (network analyzer screen)
       if (scan_indicator) {
@@ -4694,7 +4819,12 @@ void NetworkTask(void *parameter)
               lv_obj_set_style_shadow_width(btn, 0, 0);  // No shadow
               lv_obj_set_style_border_width(btn, 0, 0);  // No border
               lv_obj_set_size(btn, 440, 40);
-              lv_obj_set_style_bg_color(btn, lv_color_hex(0x333333), 0);
+              
+              // Color-code button background by WiFi channel
+              // Red for low channels (1-4), blue for high channels (11-14), gradient in between
+              uint32_t channelColor = getChannelColor(wifiNetworks[i].channel);
+              lv_obj_set_style_bg_color(btn, lv_color_hex(channelColor), 0);
+              
               lv_obj_set_style_radius(btn, 5, 0);
               lv_obj_add_event_cb(btn, network_item_event_handler, LV_EVENT_CLICKED, NULL);
               
@@ -4836,9 +4966,17 @@ void ClientScanTask(void *parameter)
       wifi_mode_t mode = WiFi.getMode();
       if (mode == WIFI_STA || mode == WIFI_AP_STA) {
         internetConnected = (WiFi.status() == WL_CONNECTED);
+        
+        // Query public IP every 5 minutes when internet is connected
+        static unsigned long lastPublicIPCheck = 0;
+        if (internetConnected && (millis() - lastPublicIPCheck > 300000 || publicIP == "---")) {
+          lastPublicIPCheck = millis();
+          publicIP = getPublicIP();
+        }
       }
     } else {
       internetConnected = false;
+      publicIP = "---";
     }
     
     // Only scan when connected in STA mode and not doing WiFi network scan
