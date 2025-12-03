@@ -41,7 +41,7 @@
  *  1.0.1 fix to address occasional hanging and longer text on Client page
  */
 
-#define APP_VERSION "1.0.1"
+#define APP_VERSION "1.0"
 
 
 #include <Arduino.h>
