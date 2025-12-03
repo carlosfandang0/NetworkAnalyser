@@ -226,6 +226,56 @@ const int INDICATOR_LED_X = 450;
 const int INDICATOR_LED_Y = 12;
 const int INDICATOR_LED_SIZE = 16;
 
+// Helper: create a consistently styled LVGL button
+static lv_obj_t *create_standard_button(
+    lv_obj_t *parent,
+    lv_coord_t width,
+    lv_coord_t height,
+    const char *text,
+    lv_event_cb_t event_cb,
+    void *user_data = nullptr,
+    lv_color_t bg_color = COLOR_BUTTON,
+    const lv_font_t *font = &lv_font_montserrat_14,
+    int radius = 10)
+{
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_size(btn, width, height);
+  lv_obj_set_style_bg_color(btn, bg_color, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  if (radius >= 0) {
+    lv_obj_set_style_radius(btn, radius, 0);
+  }
+
+  if (event_cb) {
+    lv_obj_add_event_cb(btn, event_cb, LV_EVENT_CLICKED, user_data);
+  }
+
+  if (text && strlen(text) > 0) {
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_center(label);
+  }
+
+  return btn;
+}
+
+// Helper: create a circular LED indicator with consistent styling
+static lv_obj_t *create_indicator_led(
+    lv_obj_t *parent,
+    lv_coord_t size,
+    lv_color_t color = COLOR_INDICATOR_OFF)
+{
+  lv_obj_t *led = lv_obj_create(parent);
+  lv_obj_set_size(led, size, size);
+  lv_obj_set_style_radius(led, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(led, color, 0);
+  lv_obj_set_style_border_width(led, 0, 0);
+  lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
+  return led;
+}
+
 const unsigned long NETWORK_TIMEOUT_MS = 300000;  // 5 minutes
 const unsigned long CLIENT_SCAN_INTERVAL_MS = 3000;  // 3 seconds
 const unsigned long WIFI_SCAN_INTERVAL_MS = 10000;   // 10 seconds
@@ -786,21 +836,17 @@ void createWiFiSetupUI()
   lv_obj_set_style_bg_color(wifi_setup_screen, lv_color_hex(0x000000), 0);
   
   // Clients button for navigation
-  lv_obj_t *clients_btn = lv_btn_create(wifi_setup_screen);
-  lv_obj_set_size(clients_btn, 80, 40);
-  lv_obj_align(clients_btn, LV_ALIGN_TOP_LEFT, 10, 2);
-  lv_obj_set_style_bg_color(clients_btn, COLOR_BUTTON, 0);
-  lv_obj_set_style_shadow_width(clients_btn, 0, 0);  // No shadow
-  lv_obj_set_style_border_width(clients_btn, 0, 0);  // No border
-  lv_obj_set_style_radius(clients_btn, 10, 0);  // Rounded corners
-  lv_obj_t *clients_label = lv_label_create(clients_btn);
-  lv_label_set_text(clients_label, "Clients");
-  lv_obj_center(clients_label);
-  lv_obj_add_event_cb(clients_btn, [](lv_event_t *e) {
+  lv_obj_t *clients_btn = create_standard_button(
+      wifi_setup_screen,
+      80,
+      40,
+      "Clients",
+      [](lv_event_t *e) {
     if (main_screen) {
       lv_scr_load(main_screen);
     }
-  }, LV_EVENT_CLICKED, NULL);
+      });
+  lv_obj_align(clients_btn, LV_ALIGN_TOP_LEFT, 10, 2);
   
   // Title
   lv_obj_t *title = lv_label_create(wifi_setup_screen);
@@ -810,29 +856,25 @@ void createWiFiSetupUI()
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
   
   // Scanning indicator dot (circle)
-  wifi_scan_indicator = lv_obj_create(wifi_setup_screen);
-  lv_obj_set_size(wifi_scan_indicator, INDICATOR_LED_SIZE, INDICATOR_LED_SIZE);
+  wifi_scan_indicator = create_indicator_led(wifi_setup_screen, INDICATOR_LED_SIZE);
   lv_obj_set_pos(wifi_scan_indicator, INDICATOR_LED_X, INDICATOR_LED_Y);
-  lv_obj_set_style_radius(wifi_scan_indicator, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(wifi_scan_indicator, COLOR_INDICATOR_OFF, 0);
-  lv_obj_set_style_border_width(wifi_scan_indicator, 0, 0);
   
   // Settings button (gear icon) - square, same height as Clients button
-  lv_obj_t *wifi_settings_btn = lv_btn_create(wifi_setup_screen);
-  lv_obj_set_size(wifi_settings_btn, 40, 40);
-  lv_obj_set_pos(wifi_settings_btn, INDICATOR_LED_X - 50, INDICATOR_LED_Y - 12);
-  lv_obj_set_style_bg_color(wifi_settings_btn, lv_color_hex(0x333333), 0);
-  lv_obj_set_style_shadow_width(wifi_settings_btn, 0, 0);  // No shadow
-  lv_obj_set_style_border_width(wifi_settings_btn, 0, 0);  // No border
-  lv_obj_t *wifi_settings_label = lv_label_create(wifi_settings_btn);
-  lv_label_set_text(wifi_settings_label, LV_SYMBOL_SETTINGS);
-  lv_obj_set_style_text_font(wifi_settings_label, &lv_font_montserrat_16, 0);
-  lv_obj_center(wifi_settings_label);
-  lv_obj_add_event_cb(wifi_settings_btn, [](lv_event_t *e) {
+  lv_obj_t *wifi_settings_btn = create_standard_button(
+      wifi_setup_screen,
+      40,
+      40,
+      LV_SYMBOL_SETTINGS,
+      [](lv_event_t *e) {
     if (settings_screen) {
       lv_scr_load(settings_screen);
     }
-  }, LV_EVENT_CLICKED, NULL);
+      },
+      nullptr,
+      lv_color_hex(0x333333),
+      &lv_font_montserrat_16,
+      0);
+  lv_obj_set_pos(wifi_settings_btn, INDICATOR_LED_X - 50, INDICATOR_LED_Y - 12);
   
   // Network list container - expanded to fill screen
   network_list = lv_obj_create(wifi_setup_screen);
@@ -881,31 +923,29 @@ void createWiFiSetupUI()
   lv_textarea_set_one_line(password_textarea, true);
   
   // Connect and Cancel buttons (above keyboard)
-  connect_button = lv_btn_create(password_screen);
-  lv_obj_set_size(connect_button, 200, 45);
-  lv_obj_set_pos(connect_button, 20, 95);
-  lv_obj_set_style_bg_color(connect_button, lv_color_hex(0x00AA00), 0);
-  lv_obj_set_style_shadow_width(connect_button, 0, 0);  // No shadow
-  lv_obj_set_style_border_width(connect_button, 0, 0);  // No border
-  lv_obj_add_event_cb(connect_button, connect_wifi_event_handler, LV_EVENT_CLICKED, NULL);
-  
-  lv_obj_t *connect_label = lv_label_create(connect_button);
-  lv_label_set_text(connect_label, "Connect");
-  lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_18, 0);
-  lv_obj_center(connect_label);
-  
-  cancel_button = lv_btn_create(password_screen);
-  lv_obj_set_size(cancel_button, 200, 45);
-  lv_obj_set_pos(cancel_button, 260, 95);
-  lv_obj_set_style_bg_color(cancel_button, lv_color_hex(0xAA0000), 0);
-  lv_obj_set_style_shadow_width(cancel_button, 0, 0);  // No shadow
-  lv_obj_set_style_border_width(cancel_button, 0, 0);  // No border
-  lv_obj_add_event_cb(cancel_button, cancel_wifi_event_handler, LV_EVENT_CLICKED, NULL);
-  
-  lv_obj_t *cancel_label = lv_label_create(cancel_button);
-  lv_label_set_text(cancel_label, "Cancel");
-  lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_18, 0);
-  lv_obj_center(cancel_label);
+    connect_button = create_standard_button(
+      password_screen,
+      200,
+      45,
+      "Connect",
+      connect_wifi_event_handler,
+      nullptr,
+      lv_color_hex(0x00AA00),
+      &lv_font_montserrat_18,
+      0);
+    lv_obj_set_pos(connect_button, 20, 95);
+
+    cancel_button = create_standard_button(
+      password_screen,
+      200,
+      45,
+      "Cancel",
+      cancel_wifi_event_handler,
+      nullptr,
+      lv_color_hex(0xAA0000),
+      &lv_font_montserrat_18,
+      0);
+    lv_obj_set_pos(cancel_button, 260, 95);
   
   // Keyboard - moved up 150 pixels from original y=150 position
   keyboard = lv_keyboard_create(password_screen);
@@ -931,21 +971,17 @@ void createNetworkStatsUI()
   lv_obj_set_style_bg_color(main_screen, lv_color_hex(0x000000), 0);
   
   // Networks button for navigation
-  lv_obj_t *networks_btn = lv_btn_create(main_screen);
-  lv_obj_set_size(networks_btn, 80, 40);
-  lv_obj_align(networks_btn, LV_ALIGN_TOP_LEFT, 10, 2);
-  lv_obj_set_style_bg_color(networks_btn, COLOR_BUTTON, 0);
-  lv_obj_set_style_shadow_width(networks_btn, 0, 0);  // No shadow
-  lv_obj_set_style_border_width(networks_btn, 0, 0);  // No border
-  lv_obj_set_style_radius(networks_btn, 10, 0);  // Rounded corners
-  lv_obj_t *networks_label = lv_label_create(networks_btn);
-  lv_label_set_text(networks_label, "Networks");
-  lv_obj_center(networks_label);
-  lv_obj_add_event_cb(networks_btn, [](lv_event_t *e) {
+  lv_obj_t *networks_btn = create_standard_button(
+      main_screen,
+      80,
+      40,
+      "Networks",
+      [](lv_event_t *e) {
     if (wifi_setup_screen) {
       lv_scr_load(wifi_setup_screen);
     }
-  }, LV_EVENT_CLICKED, NULL);
+      });
+  lv_obj_align(networks_btn, LV_ALIGN_TOP_LEFT, 10, 2);
   
   // Title
   lv_obj_t *title = lv_label_create(main_screen);
@@ -955,29 +991,25 @@ void createNetworkStatsUI()
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
   
   // Scanning indicator dot (circle) - top right
-  scan_indicator = lv_obj_create(main_screen);
-  lv_obj_set_size(scan_indicator, INDICATOR_LED_SIZE, INDICATOR_LED_SIZE);
+  scan_indicator = create_indicator_led(main_screen, INDICATOR_LED_SIZE);
   lv_obj_set_pos(scan_indicator, INDICATOR_LED_X, INDICATOR_LED_Y);
-  lv_obj_set_style_radius(scan_indicator, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(scan_indicator, COLOR_INDICATOR_OFF, 0);
-  lv_obj_set_style_border_width(scan_indicator, 0, 0);
   
   // Settings button (gear icon) - square, same height as Networks button
-  settings_btn = lv_btn_create(main_screen);
-  lv_obj_set_size(settings_btn, 40, 40);
-  lv_obj_set_pos(settings_btn, INDICATOR_LED_X - 50, INDICATOR_LED_Y - 12);
-  lv_obj_set_style_bg_color(settings_btn, lv_color_hex(0x333333), 0);
-  lv_obj_set_style_shadow_width(settings_btn, 0, 0);  // No shadow
-  lv_obj_set_style_border_width(settings_btn, 0, 0);  // No border
-  lv_obj_t *settings_label = lv_label_create(settings_btn);
-  lv_label_set_text(settings_label, LV_SYMBOL_SETTINGS);
-  lv_obj_set_style_text_font(settings_label, &lv_font_montserrat_16, 0);
-  lv_obj_center(settings_label);
-  lv_obj_add_event_cb(settings_btn, [](lv_event_t *e) {
+  settings_btn = create_standard_button(
+      main_screen,
+      40,
+      40,
+      LV_SYMBOL_SETTINGS,
+      [](lv_event_t *e) {
     if (settings_screen) {
       lv_scr_load(settings_screen);
     }
-  }, LV_EVENT_CLICKED, NULL);
+      },
+      nullptr,
+      lv_color_hex(0x333333),
+      &lv_font_montserrat_16,
+      0);
+  lv_obj_set_pos(settings_btn, INDICATOR_LED_X - 50, INDICATOR_LED_Y - 12);
   
   int y_offset = 50;  // Moved down 15px
   int line_height = 22;
@@ -2340,16 +2372,13 @@ void createDeviceDetailsScreen(int device_index) {
   }
   
   // Back button - align with settings button height
-  lv_obj_t *back_btn = lv_btn_create(details_screen);
-  lv_obj_set_size(back_btn, 80, 40);
+  lv_obj_t *back_btn = create_standard_button(
+      details_screen,
+      80,
+      40,
+      "Back",
+      details_back_btn_handler);
   lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 10, 2);
-  lv_obj_add_event_cb(back_btn, details_back_btn_handler, LV_EVENT_CLICKED, NULL);
-  lv_obj_set_style_bg_color(back_btn, COLOR_BUTTON, 0);
-  lv_obj_set_style_shadow_width(back_btn, 0, 0);  // No shadow
-  lv_obj_set_style_border_width(back_btn, 0, 0);  // No border
-  lv_obj_t *back_label = lv_label_create(back_btn);
-  lv_label_set_text(back_label, "Back");
-  lv_obj_center(back_label);
   
   // IP address in header (just IP, no vendor)
   lv_obj_t *header_label = lv_label_create(details_screen);
@@ -2427,12 +2456,7 @@ void createDeviceDetailsScreen(int device_index) {
   lv_obj_set_style_pad_all(scan_container, 0, 0);
   
   // Port scan LED
-  details_port_scan_led = lv_obj_create(scan_container);
-  lv_obj_set_size(details_port_scan_led, 12, 12);
-  lv_obj_set_style_radius(details_port_scan_led, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(details_port_scan_led, COLOR_INDICATOR_OFF, 0);
-  lv_obj_set_style_border_width(details_port_scan_led, 0, 0);
-  lv_obj_clear_flag(details_port_scan_led, LV_OBJ_FLAG_SCROLLABLE);
+  details_port_scan_led = create_indicator_led(scan_container, 12);
   
   // Port scan button
   lv_obj_t *scan_btn = lv_btn_create(scan_container);
@@ -2461,12 +2485,7 @@ void createDeviceDetailsScreen(int device_index) {
   lv_obj_set_style_pad_all(ping_container, 0, 0);
   
   // Ping LED
-  details_ping_led = lv_obj_create(ping_container);
-  lv_obj_set_size(details_ping_led, 12, 12);
-  lv_obj_set_style_radius(details_ping_led, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(details_ping_led, COLOR_INDICATOR_OFF, 0);
-  lv_obj_set_style_border_width(details_ping_led, 0, 0);
-  lv_obj_clear_flag(details_ping_led, LV_OBJ_FLAG_SCROLLABLE);
+  details_ping_led = create_indicator_led(ping_container, 12);
   
   // Ping button
   lv_obj_t *ping_btn = lv_btn_create(ping_container);
