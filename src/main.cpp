@@ -1042,7 +1042,7 @@ void createNetworkStatsUI()
   public_ip_label = lv_label_create(main_screen);
   lv_label_set_text(public_ip_label, "Public IP: ---");
   lv_obj_set_style_text_font(public_ip_label, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(public_ip_label, lv_color_hex(0xCCCCCC), 0);
+  lv_obj_set_style_text_color(public_ip_label, lv_color_hex(0x00FFFF), 0);
   lv_obj_align(public_ip_label, LV_ALIGN_TOP_LEFT, 10, y_offset);
   
   y_offset += line_height + 5;
