@@ -39,9 +39,10 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program. If not, see <https://www.gnu.org/licenses/>.
  *  1.0.1 fix to address occasional hanging and longer text on Client page
- */
+ *  1.0.2 abstracted style items - simplified. external IP address displayed
+*/
 
-#define APP_VERSION "1.0"
+#define APP_VERSION "1.0.2"
 
 
 #include <Arduino.h>
