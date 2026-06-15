@@ -99,38 +99,47 @@ jobs:
           echo "version=${VER:-0.0}" >> $GITHUB_OUTPUT
           echo "Version: ${VER:-0.0}"
 
+      - name: Stage firmware files for upload
+        run: |
+          mkdir -p firmware-staging
+          cp .pio/build/Guition_ESP32_4848S040/bootloader.bin firmware-staging/network-analyser-bootloader.bin
+          cp .pio/build/Guition_ESP32_4848S040/partitions.bin firmware-staging/network-analyser-partitions.bin
+          cp .pio/build/Guition_ESP32_4848S040/firmware.bin   firmware-staging/network-analyser-firmware.bin
+          cp .pio/build/Guition_ESP32_4848S040/littlefs.bin   firmware-staging/network-analyser-littlefs.bin
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
           name: firmware-network-analyser
-          path: |
-            .pio/build/Guition_ESP32_4848S040/bootloader.bin
-            .pio/build/Guition_ESP32_4848S040/partitions.bin
-            .pio/build/Guition_ESP32_4848S040/firmware.bin
-            .pio/build/Guition_ESP32_4848S040/littlefs.bin
+          path: firmware-staging/
           retention-days: 30
 
   # ============================================================================
   # JOB 2: DEPLOY
   # Calls the shared Tritium deploy workflow.
-  # All VPS logic lives in tritium-website/.github/workflows/deploy-firmware.yml
+  # All VPS logic lives in tritium-actions/.github/workflows/deploy-firmware.yml
   # ============================================================================
   deploy:
     name: Deploy to VPS
     needs: build
     uses: carlosfandang0/tritium-actions/.github/workflows/deploy-firmware.yml@main
-    secrets: inherit
+    secrets:
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
     with:
       project_slug: network-analyser
       chip_family: ESP32-S3
       version: ${{ needs.build.outputs.version }}
 
+      # Files to copy — src is the filename inside the artifact (flat structure).
       deploy_files_json: |
         [
-          {"src": ".pio/build/Guition_ESP32_4848S040/bootloader.bin", "dest": "network-analyser-bootloader.bin"},
-          {"src": ".pio/build/Guition_ESP32_4848S040/partitions.bin", "dest": "network-analyser-partitions.bin"},
-          {"src": ".pio/build/Guition_ESP32_4848S040/firmware.bin",   "dest": "network-analyser-firmware.bin"},
-          {"src": ".pio/build/Guition_ESP32_4848S040/littlefs.bin",   "dest": "network-analyser-littlefs.bin"}
+          {"src": "network-analyser-bootloader.bin", "dest": "network-analyser-bootloader.bin"},
+          {"src": "network-analyser-partitions.bin", "dest": "network-analyser-partitions.bin"},
+          {"src": "network-analyser-firmware.bin",   "dest": "network-analyser-firmware.bin"},
+          {"src": "network-analyser-littlefs.bin",   "dest": "network-analyser-littlefs.bin"}
         ]
 
       manifest_parts_json: |
