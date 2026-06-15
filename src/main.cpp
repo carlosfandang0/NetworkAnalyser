@@ -42,7 +42,7 @@
  *  1.0.2 abstracted style items - simplified. external IP address displayed
 */
 
-#define APP_VERSION "1.0.13"
+#define APP_VERSION "1.0.14"
 
 
 #include <Arduino.h>
