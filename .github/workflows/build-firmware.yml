@@ -1,0 +1,142 @@
+# =============================================================================
+# Network Analyser — Build and Deploy Firmware
+# =============================================================================
+#
+# PURPOSE
+# -------
+# Builds the Network Analyser firmware and filesystem image, then calls the
+# shared Tritium deploy workflow to copy files to the VPS and update the manifest.
+#
+# TRIGGERING
+# ----------
+# Runs automatically on any push to main that touches source files.
+# Note: the auto-version.yml workflow uses [skip ci] on its commits so this
+# workflow will NOT re-trigger in an infinite loop.
+#
+# VERSIONING
+# ----------
+# Version is managed automatically by auto-version.yml which increments the
+# build number on every push:
+#   src/main.cpp  ->  #define APP_VERSION "1.0.4"
+# You can also bump the major.minor manually before pushing a release.
+#
+# WHAT GETS DEPLOYED
+# ------------------
+# Four files are copied to the VPS and served at /firmware/ by Apache:
+#   network-analyser-bootloader.bin
+#   network-analyser-partitions.bin
+#   network-analyser-firmware.bin
+#   network-analyser-littlefs.bin    (OUI database + config defaults)
+#
+# The JSON manifest at /var/www/tritium-firmware/network-analyser-manifest.json
+# is updated automatically with the new version and today's date.
+#
+# SECRETS REQUIRED (set in this repo's Settings → Secrets → Actions)
+# -------------------------------------------------------------------
+#   VPS_SSH_KEY          — private SSH key for the deploy user on the VPS
+#   VPS_SSH_KNOWN_HOSTS  — run:  ssh-keyscan 54.37.19.85
+#   VPS_USER             — deploy username (e.g. root or deploy)
+#   VPS_HOST             — VPS IP or hostname (54.37.19.85)
+# =============================================================================
+
+name: Build and deploy firmware
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'include/**'
+      - 'data/**'
+      - 'platformio.ini'
+      - 'partition_table.csv'
+  workflow_dispatch:
+
+jobs:
+  # ============================================================================
+  # JOB 1: BUILD
+  # ============================================================================
+  build:
+    name: Build Network Analyser firmware
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('platformio.ini') }}
+          restore-keys: platformio-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: platformio run -e Guition_ESP32_4848S040
+
+      - name: Build filesystem image (LittleFS)
+        run: platformio run -e Guition_ESP32_4848S040 --target buildfs
+
+      - name: Extract version from source
+        id: version
+        run: |
+          # Reads:  #define APP_VERSION "1.0.4"
+          VER=$(grep -oP '(?<=#define APP_VERSION ")[^"]+' src/main.cpp | head -1)
+          echo "version=${VER:-0.0}" >> $GITHUB_OUTPUT
+          echo "Version: ${VER:-0.0}"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-network-analyser
+          path: |
+            .pio/build/Guition_ESP32_4848S040/bootloader.bin
+            .pio/build/Guition_ESP32_4848S040/partitions.bin
+            .pio/build/Guition_ESP32_4848S040/firmware.bin
+            .pio/build/Guition_ESP32_4848S040/littlefs.bin
+          retention-days: 30
+
+  # ============================================================================
+  # JOB 2: DEPLOY
+  # Calls the shared Tritium deploy workflow.
+  # All VPS logic lives in tritium-website/.github/workflows/deploy-firmware.yml
+  # ============================================================================
+  deploy:
+    name: Deploy to VPS
+    needs: build
+    uses: carlosfandang0/tritium-website/.github/workflows/deploy-firmware.yml@main
+    secrets: inherit
+    with:
+      project_slug: network-analyser
+      chip_family: ESP32-S3
+      version: ${{ needs.build.outputs.version }}
+
+      deploy_files_json: |
+        [
+          {"src": ".pio/build/Guition_ESP32_4848S040/bootloader.bin", "dest": "network-analyser-bootloader.bin"},
+          {"src": ".pio/build/Guition_ESP32_4848S040/partitions.bin", "dest": "network-analyser-partitions.bin"},
+          {"src": ".pio/build/Guition_ESP32_4848S040/firmware.bin",   "dest": "network-analyser-firmware.bin"},
+          {"src": ".pio/build/Guition_ESP32_4848S040/littlefs.bin",   "dest": "network-analyser-littlefs.bin"}
+        ]
+
+      manifest_parts_json: |
+        [
+          {"path": "/firmware/network-analyser-bootloader.bin", "offset": 0},
+          {"path": "/firmware/network-analyser-partitions.bin", "offset": 32768},
+          {"path": "/firmware/network-analyser-firmware.bin",   "offset": 65536},
+          {"path": "/firmware/network-analyser-littlefs.bin",   "offset": 4653056}
+        ]
