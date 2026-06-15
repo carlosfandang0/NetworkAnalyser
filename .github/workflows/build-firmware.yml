@@ -118,7 +118,7 @@ jobs:
   deploy:
     name: Deploy to VPS
     needs: build
-    uses: carlosfandang0/tritium-website/.github/workflows/deploy-firmware.yml@main
+    uses: carlosfandang0/tritium-actions/.github/workflows/deploy-firmware.yml@main
     secrets: inherit
     with:
       project_slug: network-analyser
