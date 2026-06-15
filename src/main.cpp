@@ -191,6 +191,44 @@ TaskHandle_t port_scan_task_handle = NULL;
 TaskHandle_t ping_task_handle = NULL;
 volatile bool need_details_refresh = false;
 
+// ============================================================
+// NMEA SCOPE - Global state
+// ============================================================
+#define NMEA_MAX_TYPES    32
+#define NMEA_CAPTURE_SIZE 20
+#define NMEA_MAX_LEN      90   // NMEA0183 max sentence length + null
+
+struct NMEAMsgType {
+  char          type[8];        // talker+sentence ID, e.g. "GPRMC"
+  uint32_t      count;
+  uint32_t      badCount;       // sentences with failed checksum
+  unsigned long firstSeenMs;
+  unsigned long lastSeenMs;
+  bool          lastChecksumOk;
+};
+
+NMEAMsgType       nmea_types[NMEA_MAX_TYPES];
+int               nmea_type_count         = 0;
+SemaphoreHandle_t nmea_mutex              = NULL;
+volatile unsigned long nmea_last_packet_ms = 0;  // millis() of last received packet
+
+char          nmea_capture[NMEA_CAPTURE_SIZE][NMEA_MAX_LEN];
+int           nmea_capture_count  = 0;
+volatile bool nmea_capture_active = false;  // NMEATask is collecting
+volatile bool nmea_capture_done   = false;  // Capture complete, UI needs refresh
+volatile bool nmea_type_list_dirty = false; // New type or count changed
+volatile bool nmea_udp_open        = false; // At least one UDP socket open
+volatile uint32_t nmea_packets_rx  = 0;     // Raw datagrams received
+volatile uint32_t nmea_bad_cs      = 0;     // Sentences with bad checksum (global)
+
+lv_obj_t *nmea_screen        = nullptr;
+lv_obj_t *nmea_type_list     = nullptr;
+lv_obj_t *nmea_capture_list  = nullptr;
+lv_obj_t *nmea_status_label  = nullptr;
+lv_obj_t *nmea_capture_btn   = nullptr;
+lv_obj_t *nmea_activity_led  = nullptr;
+// ============================================================
+
 // Network scanner configuration (loaded from config.txt)
 bool activeProbeEnabled = true;
 int probeIntervalSeconds = 30;
@@ -404,6 +442,9 @@ String getPublicIP() {
 }
 
 void updateNetworkStats();
+void createNMEAScopeScreen();
+void updateNMEAScope();
+void NMEATask(void *parameter);
 void initWiFi();
 void createWiFiSetupUI();
 void createNetworkStatsUI();
@@ -835,20 +876,15 @@ void createWiFiSetupUI()
   // Main setup screen
   wifi_setup_screen = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(wifi_setup_screen, lv_color_hex(0x000000), 0);
-  
-  // Clients button for navigation
-  lv_obj_t *clients_btn = create_standard_button(
-      wifi_setup_screen,
-      80,
-      40,
-      "Clients",
+
+  // Cycling page button - label shows current page, press goes to next
+  lv_obj_t *page_btn_wifi = create_standard_button(
+      wifi_setup_screen, 90, 40, "Networks",
       [](lv_event_t *e) {
-    if (main_screen) {
-      lv_scr_load(main_screen);
-    }
+        if (main_screen) lv_scr_load(main_screen);
       });
-  lv_obj_align(clients_btn, LV_ALIGN_TOP_LEFT, 10, 2);
-  
+  lv_obj_align(page_btn_wifi, LV_ALIGN_TOP_LEFT, 10, 2);
+
   // Title
   lv_obj_t *title = lv_label_create(wifi_setup_screen);
   lv_label_set_text(title, "WiFi Networks");
@@ -970,20 +1006,18 @@ void createNetworkStatsUI()
   
   main_screen = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(main_screen, lv_color_hex(0x000000), 0);
-  
-  // Networks button for navigation
-  lv_obj_t *networks_btn = create_standard_button(
-      main_screen,
-      80,
-      40,
-      "Networks",
+
+  // Cycling page button - label shows current page, press goes to next
+  lv_obj_t *page_btn_main = create_standard_button(
+      main_screen, 90, 40, "Clients",
       [](lv_event_t *e) {
-    if (wifi_setup_screen) {
-      lv_scr_load(wifi_setup_screen);
-    }
+        if (nmea_screen) lv_scr_load(nmea_screen);
       });
-  lv_obj_align(networks_btn, LV_ALIGN_TOP_LEFT, 10, 2);
-  
+  lv_obj_align(page_btn_main, LV_ALIGN_TOP_LEFT, 10, 2);
+
+  // NMEA Scope navigation button
+  // (removed - replaced by cycling page button above)
+
   // Title
   lv_obj_t *title = lv_label_create(main_screen);
   lv_label_set_text(title, "Network Clients");
@@ -1463,6 +1497,391 @@ void create_settings_screen() {
   
   xSemaphoreGive(lvgl_mutex);
 }
+
+// ============================================================
+// NMEA SCOPE - Functions
+// ============================================================
+
+// Validate NMEA0183 checksum: XOR bytes between '$' and '*', compare to hex suffix
+static bool validateNMEAChecksum(const char *sentence) {
+  if (!sentence || sentence[0] != '$') return false;
+  const char *p = sentence + 1;
+  uint8_t calc = 0;
+  while (*p && *p != '*') calc ^= (uint8_t)(*p++);
+  if (*p != '*') return false;
+  p++;
+  if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1])) return false;
+  char hexStr[3] = {p[0], p[1], '\0'};
+  return calc == (uint8_t)strtol(hexStr, nullptr, 16);
+}
+
+// Parse one NMEA sentence: update type registry and optionally fill capture buffer
+static void processNMEASentence(const char *sentence) {
+  if (!sentence || sentence[0] != '$') return;
+
+  // Extract type field (talker+sentence ID) between '$' and first ',' / '*'
+  const char *p = sentence + 1;
+  const char *end = p;
+  while (*end && *end != ',' && *end != '*' && *end != '\r' && *end != '\n') end++;
+  int typeLen = (int)(end - p);
+  if (typeLen < 2 || typeLen > 7) return;
+
+  char type[8];
+  memcpy(type, p, typeLen);
+  type[typeLen] = '\0';
+
+  bool checksumOk = validateNMEAChecksum(sentence);
+  unsigned long now = millis();
+  nmea_last_packet_ms = now;
+
+  if (xSemaphoreTake(nmea_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+
+  // Find or create type entry
+  int idx = -1;
+  for (int i = 0; i < nmea_type_count; i++) {
+    if (strncmp(nmea_types[i].type, type, 7) == 0) { idx = i; break; }
+  }
+  if (idx < 0 && nmea_type_count < NMEA_MAX_TYPES) {
+    idx = nmea_type_count++;
+    strncpy(nmea_types[idx].type, type, 7);
+    nmea_types[idx].type[7] = '\0';
+    nmea_types[idx].count = 0;
+    nmea_types[idx].badCount = 0;
+    nmea_types[idx].firstSeenMs = now;
+  }
+  if (idx >= 0) {
+    nmea_types[idx].count++;
+    if (!checksumOk) {
+      nmea_types[idx].badCount++;
+      nmea_bad_cs++;
+    }
+    nmea_types[idx].lastSeenMs = now;
+    nmea_types[idx].lastChecksumOk = checksumOk;
+    nmea_type_list_dirty = true;
+  }
+
+  // Fill capture buffer when active
+  if (nmea_capture_active && nmea_capture_count < NMEA_CAPTURE_SIZE) {
+    strncpy(nmea_capture[nmea_capture_count], sentence, NMEA_MAX_LEN - 1);
+    nmea_capture[nmea_capture_count][NMEA_MAX_LEN - 1] = '\0';
+    if (++nmea_capture_count >= NMEA_CAPTURE_SIZE) {
+      nmea_capture_active = false;
+      nmea_capture_done   = true;
+    }
+  }
+  xSemaphoreGive(nmea_mutex);
+}
+
+// Update NMEA scope display - called from NMEATask when screen is active
+void updateNMEAScope() {
+  if (!nmea_screen || !nmea_type_list) return;
+  // Always update status label (shows socket open state / packet count)
+  // Only rebuild the type list when data has changed
+  bool rebuildList = nmea_type_list_dirty || nmea_capture_done;
+  if (!rebuildList) {
+    // Still update just the status label
+    if (nmea_status_label) {
+      char buf[80];
+      if (!wifiConnected) {
+        snprintf(buf, sizeof(buf), "Waiting for WiFi...");
+      } else if (!nmea_udp_open) {
+        snprintf(buf, sizeof(buf), "UDP socket failed to open!");
+      } else {
+        // Compute global quality from totals (no mutex needed - reading volatile atomics)
+        uint32_t totalSent = 0;
+        for (int i = 0; i < nmea_type_count; i++) totalSent += nmea_types[i].count;
+        int gq = (totalSent > 0)
+                 ? (int)(100.0f * (totalSent - nmea_bad_cs) / totalSent + 0.5f)
+                 : 100;
+        snprintf(buf, sizeof(buf), "UDP :2000 & :10110  |  %lu pkts  |  %d type%s  |  Q:%d%%",
+                 (unsigned long)nmea_packets_rx, nmea_type_count,
+                 nmea_type_count == 1 ? "" : "s", gq);
+      }
+      if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        lv_label_set_text(nmea_status_label, buf);
+        uint32_t totalSent2 = 0;
+        for (int i = 0; i < nmea_type_count; i++) totalSent2 += nmea_types[i].count;
+        int gq2 = (totalSent2 > 0)
+                  ? (int)(100.0f * (totalSent2 - nmea_bad_cs) / totalSent2 + 0.5f)
+                  : 100;
+        lv_obj_set_style_text_color(nmea_status_label,
+          !wifiConnected ? lv_color_hex(0xFF4444) :
+          !nmea_udp_open ? lv_color_hex(0xFF8800) :
+          gq2 < 80       ? lv_color_hex(0xFF4444) :
+          gq2 < 100      ? lv_color_hex(0xFF8800) :
+                           lv_color_hex(0x00FFFF), 0);
+        xSemaphoreGive(lvgl_mutex);
+      }
+    }
+    return;
+  }
+
+  // Snapshot type data under nmea_mutex
+  struct TypeSnap {
+    char          type[8];
+    uint32_t      count;
+    uint32_t      badCount;
+    unsigned long firstSeenMs;
+    unsigned long lastSeenMs;
+    bool          checksumOk;
+  };
+  // static: keeps these off the task stack (1800 + 768 bytes would overflow 4K stack)
+  static TypeSnap snap[NMEA_MAX_TYPES];
+  int snapCount = 0;
+  bool captureReady = false;
+  static char capSnap[NMEA_CAPTURE_SIZE][NMEA_MAX_LEN];
+  int capCount = 0;
+
+  if (xSemaphoreTake(nmea_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    snapCount = nmea_type_count;
+    for (int i = 0; i < snapCount; i++) {
+      memcpy(snap[i].type, nmea_types[i].type, 8);
+      snap[i].count       = nmea_types[i].count;
+      snap[i].badCount    = nmea_types[i].badCount;
+      snap[i].firstSeenMs = nmea_types[i].firstSeenMs;
+      snap[i].lastSeenMs  = nmea_types[i].lastSeenMs;
+      snap[i].checksumOk  = nmea_types[i].lastChecksumOk;
+    }
+    nmea_type_list_dirty = false;
+    if (nmea_capture_done) {
+      captureReady = true;
+      capCount = nmea_capture_count;
+      for (int i = 0; i < capCount; i++) memcpy(capSnap[i], nmea_capture[i], NMEA_MAX_LEN);
+      nmea_capture_done = false;
+    }
+    xSemaphoreGive(nmea_mutex);
+  } else {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+
+  // --- Type registry ---
+  lv_obj_clean(nmea_type_list);
+  if (snapCount == 0) {
+    lv_obj_t *lbl = lv_label_create(nmea_type_list);
+    lv_label_set_text(lbl, "Waiting for NMEA sentences...");
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFF00), 0);
+  } else {
+    // Column header
+    lv_obj_t *hdr = lv_label_create(nmea_type_list);
+    lv_label_set_text(hdr, "TYPE      COUNT    RATE     AGE   CHK");
+    lv_obj_set_style_text_font(hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x777777), 0);
+    lv_obj_set_width(hdr, lv_pct(100));
+
+    for (int i = 0; i < snapCount; i++) {
+      unsigned long ageSec = (now - snap[i].lastSeenMs) / 1000;
+      char ageStr[10];
+      if (ageSec < 60)        snprintf(ageStr, sizeof(ageStr), "%lus",  ageSec);
+      else if (ageSec < 3600) snprintf(ageStr, sizeof(ageStr), "%lum",  ageSec / 60);
+      else                    snprintf(ageStr, sizeof(ageStr), "%luh",  ageSec / 3600);
+
+      unsigned long elapsed = (now - snap[i].firstSeenMs) / 1000;
+      float rate = (elapsed > 0) ? (float)snap[i].count / (float)elapsed : 0.0f;
+
+      // Per-type quality %
+      int quality = (snap[i].count > 0)
+                    ? (int)(100.0f * (snap[i].count - snap[i].badCount) / snap[i].count + 0.5f)
+                    : 100;
+
+      char line[64];
+      snprintf(line, sizeof(line), "$%-6s  %5lu  %5.2f/s  %4s  Q:%d%%",
+               snap[i].type, (unsigned long)snap[i].count, rate, ageStr, quality);
+
+      lv_obj_t *lbl = lv_label_create(nmea_type_list);
+      lv_label_set_text(lbl, line);
+      lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+      lv_obj_set_width(lbl, lv_pct(100));
+
+      lv_color_t col;
+      if (quality < 80)              col = lv_color_hex(0xFF4444);  // Red   - poor quality
+      else if (quality < 100)        col = lv_color_hex(0xFF8800);  // Orange - some errors
+      else if (ageSec > 30)          col = lv_color_hex(0x888888);  // Gray  - stale
+      else if (ageSec > 5)           col = lv_color_hex(0xFFFF00);  // Yellow - slowing
+      else                           col = lv_color_hex(0x00FF00);  // Green  - fresh & perfect
+      lv_obj_set_style_text_color(lbl, col, 0);
+    }
+  }
+
+  // --- Status label ---
+  if (nmea_status_label) {
+    char statusBuf[80];
+    if (!wifiConnected) {
+      snprintf(statusBuf, sizeof(statusBuf), "Waiting for WiFi...");
+      lv_obj_set_style_text_color(nmea_status_label, lv_color_hex(0xFF4444), 0);
+    } else {
+      // Global quality across all sentence types
+      uint32_t totalSentences = 0;
+      for (int i = 0; i < snapCount; i++) totalSentences += snap[i].count;
+      int globalQ = (totalSentences > 0)
+                    ? (int)(100.0f * (totalSentences - nmea_bad_cs) / totalSentences + 0.5f)
+                    : 100;
+      snprintf(statusBuf, sizeof(statusBuf), "UDP :2000 & :10110  |  %lu pkts  |  %d type%s  |  Q:%d%%",
+               (unsigned long)nmea_packets_rx, snapCount, snapCount == 1 ? "" : "s", globalQ);
+      lv_obj_set_style_text_color(nmea_status_label,
+        globalQ < 80  ? lv_color_hex(0xFF4444) :
+        globalQ < 100 ? lv_color_hex(0xFF8800) :
+                        lv_color_hex(0x00FFFF), 0);
+    }
+    lv_label_set_text(nmea_status_label, statusBuf);
+  }
+
+  // --- Capture button label ---
+  if (captureReady && nmea_capture_btn) {
+    lv_obj_t *btn_lbl = lv_obj_get_child(nmea_capture_btn, 0);
+    if (btn_lbl) lv_label_set_text(btn_lbl, "Capture 20");
+  }
+
+  // --- Capture list ---
+  if (captureReady && nmea_capture_list) {
+    lv_obj_clean(nmea_capture_list);
+    if (capCount == 0) {
+      lv_obj_t *lbl = lv_label_create(nmea_capture_list);
+      lv_label_set_text(lbl, "No sentences captured.");
+      lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+      lv_obj_set_style_text_color(lbl, lv_color_hex(0x888888), 0);
+    } else {
+      for (int i = 0; i < capCount; i++) {
+        lv_obj_t *lbl = lv_label_create(nmea_capture_list);
+        lv_label_set_text(lbl, capSnap[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x00FFFF), 0);
+        lv_obj_set_width(lbl, lv_pct(100));
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+      }
+    }
+  }
+
+  xSemaphoreGive(lvgl_mutex);
+}
+
+// Create the NMEA Scope screen (480x480)
+void createNMEAScopeScreen() {
+  if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("[NMEA] Failed to acquire mutex for NMEA Scope UI");
+    return;
+  }
+
+  nmea_screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(nmea_screen, lv_color_hex(0x000000), 0);
+
+  // Cycling page button - label shows current page, press goes to next
+  lv_obj_t *page_btn_nmea = create_standard_button(
+      nmea_screen, 90, 40, "NMEA",
+      [](lv_event_t *e) { if (wifi_setup_screen) lv_scr_load(wifi_setup_screen); });
+  lv_obj_align(page_btn_nmea, LV_ALIGN_TOP_LEFT, 10, 2);
+
+  // Title
+  lv_obj_t *title = lv_label_create(nmea_screen);
+  lv_label_set_text(title, "NMEA Scope");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(title, COLOR_TITLE, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
+
+  // Activity LED (blinks green when packets arrive)
+  nmea_activity_led = create_indicator_led(nmea_screen, INDICATOR_LED_SIZE);
+  lv_obj_set_pos(nmea_activity_led, INDICATOR_LED_X, INDICATOR_LED_Y);
+
+  // Status: ports being listened on
+  nmea_status_label = lv_label_create(nmea_screen);
+  lv_label_set_text(nmea_status_label, "Waiting for WiFi...");
+  lv_obj_set_style_text_font(nmea_status_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(nmea_status_label, lv_color_hex(0x00FFFF), 0);
+  lv_obj_set_pos(nmea_status_label, 10, 52);
+  lv_obj_set_width(nmea_status_label, 440);
+  lv_label_set_long_mode(nmea_status_label, LV_LABEL_LONG_DOT);
+
+  // ---- Type registry (scrollable, y=70 to y=268) ----
+  nmea_type_list = lv_obj_create(nmea_screen);
+  lv_obj_set_size(nmea_type_list, 460, 198);
+  lv_obj_set_pos(nmea_type_list, 10, 70);
+  lv_obj_set_style_bg_opa(nmea_type_list, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(nmea_type_list, 0, 0);
+  lv_obj_set_style_radius(nmea_type_list, 0, 0);
+  lv_obj_set_style_pad_all(nmea_type_list, 3, 0);
+  lv_obj_set_flex_flow(nmea_type_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(nmea_type_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_scrollbar_mode(nmea_type_list, LV_SCROLLBAR_MODE_AUTO);
+
+  lv_obj_t *waiting_lbl = lv_label_create(nmea_type_list);
+  lv_label_set_text(waiting_lbl, "Waiting for NMEA sentences...");
+  lv_obj_set_style_text_font(waiting_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(waiting_lbl, lv_color_hex(0xFFFF00), 0);
+
+  // ---- Divider line ----
+  lv_obj_t *divider = lv_obj_create(nmea_screen);
+  lv_obj_set_size(divider, 460, 2);
+  lv_obj_set_pos(divider, 10, 272);
+  lv_obj_set_style_bg_color(divider, lv_color_hex(0x333333), 0);
+  lv_obj_set_style_border_width(divider, 0, 0);
+  lv_obj_clear_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
+
+  // ---- Capture button ----
+  nmea_capture_btn = create_standard_button(
+      nmea_screen, 175, 38, "Capture 20",
+      [](lv_event_t *e) {
+        if (xSemaphoreTake(nmea_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+          nmea_capture_count  = 0;
+          nmea_capture_active = true;
+          nmea_capture_done   = false;
+          xSemaphoreGive(nmea_mutex);
+        }
+        lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+        if (lbl) lv_label_set_text(lbl, "Capturing...");
+      },
+      nullptr, lv_color_hex(0x1a4a1a), &lv_font_montserrat_14);
+  lv_obj_set_pos(nmea_capture_btn, 10, 278);
+
+  // ---- Clear button ----
+  lv_obj_t *clear_btn = create_standard_button(
+      nmea_screen, 100, 38, "Clear",
+      [](lv_event_t *e) {
+        if (xSemaphoreTake(nmea_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+          nmea_capture_count  = 0;
+          nmea_capture_active = false;
+          nmea_capture_done   = false;
+          xSemaphoreGive(nmea_mutex);
+        }
+        if (nmea_capture_btn) {
+          lv_obj_t *lbl = lv_obj_get_child(nmea_capture_btn, 0);
+          if (lbl) lv_label_set_text(lbl, "Capture 20");
+        }
+        if (nmea_capture_list) lv_obj_clean(nmea_capture_list);
+      },
+      nullptr, lv_color_hex(0x4a1a1a), &lv_font_montserrat_14);
+  lv_obj_set_pos(clear_btn, 195, 278);
+
+  // ---- Capture buffer (scrollable, y=320 to y=479) ----
+  nmea_capture_list = lv_obj_create(nmea_screen);
+  lv_obj_set_size(nmea_capture_list, 460, 158);
+  lv_obj_set_pos(nmea_capture_list, 10, 320);
+  lv_obj_set_style_bg_color(nmea_capture_list, lv_color_hex(0x080810), 0);
+  lv_obj_set_style_bg_opa(nmea_capture_list, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(nmea_capture_list, lv_color_hex(0x333355), 0);
+  lv_obj_set_style_border_width(nmea_capture_list, 1, 0);
+  lv_obj_set_style_radius(nmea_capture_list, 4, 0);
+  lv_obj_set_style_pad_all(nmea_capture_list, 4, 0);
+  lv_obj_set_flex_flow(nmea_capture_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(nmea_capture_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_scroll_dir(nmea_capture_list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(nmea_capture_list, LV_SCROLLBAR_MODE_AUTO);
+
+  lv_obj_t *cap_hint = lv_label_create(nmea_capture_list);
+  lv_label_set_text(cap_hint, "Press 'Capture 20' to sample the next 20 NMEA sentences.");
+  lv_obj_set_style_text_font(cap_hint, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(cap_hint, lv_color_hex(0x666666), 0);
+  lv_obj_set_width(cap_hint, lv_pct(100));
+  lv_label_set_long_mode(cap_hint, LV_LABEL_LONG_WRAP);
+
+  xSemaphoreGive(lvgl_mutex);
+  Serial.println("[NMEA] NMEA Scope screen created");
+}
+// ============================================================
 
 // Update network statistics display
 void updateNetworkStats()
@@ -4312,6 +4731,99 @@ void HostnameResolverTask(void *parameter) {
   }
 }
 
+// NMEATask - listen for NMEA0183 sentences on UDP ports 2000 and 10110
+void NMEATask(void *parameter) {
+  // Wait until WiFi is connected (any mode with IP is fine)
+  while (!wifiConnected) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  // Brief settle delay after connect
+  vTaskDelay(pdMS_TO_TICKS(500));
+  Serial.println("[NMEA] WiFi ready, opening UDP sockets...");
+
+  WiFiUDP udp2000, udp10110;
+  bool open2000  = udp2000.begin(2000);
+  bool open10110 = udp10110.begin(10110);
+  nmea_udp_open = (open2000 || open10110);
+  nmea_type_list_dirty = true;  // Force status label update on screen
+  Serial.printf("[NMEA] Port 2000: %s | Port 10110: %s\n",
+                open2000 ? "OK" : "FAIL", open10110 ? "OK" : "FAIL");
+
+  // Buffer large enough for one UDP datagram containing several NMEA sentences
+  char buf[NMEA_MAX_LEN * 6];
+  unsigned long lastUIUpdate = 0;
+
+  while (true) {
+    // Handle WiFi drop: wait for reconnect and reopen sockets
+    if (!wifiConnected) {
+      udp2000.stop();
+      udp10110.stop();
+      open2000 = open10110 = false;
+      while (!wifiConnected) vTaskDelay(pdMS_TO_TICKS(2000));
+      vTaskDelay(pdMS_TO_TICKS(500));
+      open2000  = udp2000.begin(2000);
+      open10110 = udp10110.begin(10110);
+      Serial.printf("[NMEA] Reconnected. Port 2000: %s | Port 10110: %s\n",
+                    open2000 ? "OK" : "FAIL", open10110 ? "OK" : "FAIL");
+    }
+
+    // Poll both UDP ports
+    for (int port = 0; port < 2; port++) {
+      WiFiUDP &udp   = (port == 0) ? udp2000  : udp10110;
+      bool    isOpen = (port == 0) ? open2000  : open10110;
+      if (!isOpen) continue;
+
+      int pktLen = udp.parsePacket();
+      if (pktLen <= 0) continue;
+
+      int readLen = udp.read(buf, sizeof(buf) - 1);
+      if (readLen <= 0) continue;
+      buf[readLen] = '\0';
+      nmea_packets_rx++;
+
+      // Split datagram on newline boundaries — one sentence per line
+      char *ptr    = buf;
+      char *bufEnd = buf + readLen;
+      while (ptr < bufEnd) {
+        // Skip blank/whitespace lines
+        while (ptr < bufEnd && (*ptr == '\r' || *ptr == '\n' || *ptr == ' ')) ptr++;
+        if (ptr >= bufEnd) break;
+
+        // Find end of this line
+        char *lineEnd = ptr;
+        while (lineEnd < bufEnd && *lineEnd != '\n' && *lineEnd != '\r') lineEnd++;
+
+        // Strip trailing CR/spaces
+        char *sentEnd = lineEnd - 1;
+        while (sentEnd >= ptr && (*sentEnd == '\r' || *sentEnd == '\n' || *sentEnd == ' ')) sentEnd--;
+
+        int slen = (int)(sentEnd - ptr + 1);
+        if (slen > 5 && ptr[0] == '$') {
+          char sentence[NMEA_MAX_LEN];
+          int copyLen = (slen < NMEA_MAX_LEN - 1) ? slen : NMEA_MAX_LEN - 1;
+          memcpy(sentence, ptr, copyLen);
+          sentence[copyLen] = '\0';
+          processNMEASentence(sentence);
+        }
+        ptr = lineEnd + 1;
+      }
+    }
+
+    // Refresh the NMEA screen every 2 seconds, or immediately when capture finishes
+    unsigned long now = millis();
+    if (nmea_capture_done || (now - lastUIUpdate >= 2000)) {
+      lastUIUpdate = now;
+      if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        bool active = (lv_scr_act() == nmea_screen);
+        xSemaphoreGive(lvgl_mutex);
+        if (active) updateNMEAScope();
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
 // LVGL task
 void LVGLTask(void *parameter)
 {
@@ -4375,6 +4887,23 @@ void LVGLTask(void *parameter)
       } else {
         // Gray when not scanning
         lv_obj_set_style_bg_color(wifi_scan_indicator, COLOR_INDICATOR_OFF, 0);
+      }
+    }
+
+    // Handle NMEA activity LED (blinks green when packets received recently)
+    if (nmea_activity_led) {
+      unsigned long currentTime = millis();
+      if (nmea_last_packet_ms > 0 && (currentTime - nmea_last_packet_ms) < 5000) {
+        static unsigned long nmeaBlinkTime = 0;
+        static bool nmeaBlinkState = false;
+        if (currentTime - nmeaBlinkTime >= LED_BLINK_INTERVAL_MS) {
+          nmeaBlinkTime = currentTime;
+          nmeaBlinkState = !nmeaBlinkState;
+          lv_obj_set_style_bg_color(nmea_activity_led,
+            nmeaBlinkState ? COLOR_INDICATOR_ON : COLOR_INDICATOR_OFF, 0);
+        }
+      } else {
+        lv_obj_set_style_bg_color(nmea_activity_led, COLOR_INDICATOR_OFF, 0);
       }
     }
     
@@ -5180,10 +5709,11 @@ void setup()
   fs_mutex = xSemaphoreCreateMutex();
   scan_mutex = xSemaphoreCreateMutex();
   devices_mutex = xSemaphoreCreateMutex();
+  nmea_mutex = xSemaphoreCreateMutex();
   wifi_scan_queue = xQueueCreate(5, sizeof(uint8_t));
   hostname_queue = xQueueCreate(100, sizeof(HostnameRequest));
   
-  if (fs_mutex == NULL || lvgl_mutex == NULL || scan_mutex == NULL || devices_mutex == NULL || sdFileMutex == NULL || wifi_scan_queue == NULL || hostname_queue == NULL)
+  if (fs_mutex == NULL || lvgl_mutex == NULL || scan_mutex == NULL || devices_mutex == NULL || nmea_mutex == NULL || sdFileMutex == NULL || wifi_scan_queue == NULL || hostname_queue == NULL)
   {
     Serial.println("[ERROR] Failed to create mutexes or queues!");
     return;
@@ -5221,6 +5751,7 @@ void setup()
   xTaskCreatePinnedToCore(DHCPSnoopTask, "DHCPSnoop", 3072, NULL, 2, NULL, 0);  // Network timing critical
   xTaskCreatePinnedToCore(WiFiScanTask, "WiFiScan", 2048, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(ClientScanTask, "ClientScan", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(NMEATask, "NMEAScope", 8192, NULL, 1, NULL, 0);
   
   // Vendor upgrades now integrated into ClientScanTask (no separate task needed)
   
@@ -5242,6 +5773,7 @@ void setup()
   createWiFiSetupUI();
   createNetworkStatsUI();
   create_settings_screen();
+  createNMEAScopeScreen();
   
   // Load appropriate starting screen based on WiFi mode
   if (WiFi.getMode() == WIFI_AP) {
